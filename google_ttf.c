@@ -374,6 +374,8 @@ int ttf_soc_estimate(ktime_t *res, const struct batt_ttf_stats *stats,
 		ratio = ttf_elap(&elap, stats, ce_data, qnum_toint(soc));
 		if (ratio >= 0)
 			estimate += (elap * (100 - frac)) / 100;
+		if (ratio > max_ratio)
+			max_ratio = ratio;
 
 		i += 1;
 	}
@@ -402,6 +404,8 @@ int ttf_soc_estimate(ktime_t *res, const struct batt_ttf_stats *stats,
 		ratio = ttf_elap(&elap, stats, ce_data, qnum_toint(last));
 		if (ratio >= 0)
 			estimate += (elap * frac) / 100;
+		if (ratio > max_ratio)
+			max_ratio = ratio;
 	}
 
 	*res = estimate / 100;
@@ -733,7 +737,7 @@ static void ttf_tier_update(struct batt_ttf_stats *stats,
 		if (!force && i == 0 && (chg_ts->soc_in >> 8) > 1)
 			continue;
 		/* update last tier stats only at full */
-		if (!force && last_tier && ((chg_s->ssoc_out >> 8) != 100))
+		if (!force && last_tier && chg_s->ssoc_out != 100)
 			continue;
 
 		/*  */
@@ -920,6 +924,17 @@ static int ttf_as_default(struct ttf_adapter_stats *as, int i, int table_i)
 	return table_i;
 }
 
+void ttf_tier_reset(struct batt_ttf_stats *stats)
+{
+	int i;
+
+	for (i = 0; i < GBMS_STATS_TIER_COUNT; i++) {
+		stats->tier_stats[i].cc_in = 0;
+		stats->tier_stats[i].cc_total = 0;
+		stats->tier_stats[i].avg_time = 0;
+	}
+}
+
 static int ttf_init_tier_parse_dt(struct batt_ttf_stats *stats,
 				  struct device *device)
 {
@@ -942,6 +957,8 @@ static int ttf_init_tier_parse_dt(struct batt_ttf_stats *stats,
 
 	for (i = 0; i < GBMS_STATS_TIER_COUNT; i++)
 		stats->tier_stats[i].soc_in = tier_table[i] << 8;
+
+	ttf_tier_reset(stats);
 
 	return 0;
 }

@@ -125,6 +125,7 @@ struct mdis_thermal_device
 	u32 *thermal_mitigation;
 	int thermal_levels;
 	int current_level;
+	int therm_fan_alarm_level;
 };
 
 struct gcpm_drv  {
@@ -154,6 +155,7 @@ struct gcpm_drv  {
 	/* MDIS: device and current budget */
 	struct mdis_thermal_device thermal_device;
 	struct gvotable_election *mdis_votable;
+	struct gvotable_election *fan_level_votable;
 
 	/* CSI */
 	struct gvotable_election *csi_status_votable;
@@ -2319,6 +2321,34 @@ static ssize_t dc_ctl_store(struct device *dev,
 }
 static DEVICE_ATTR_RW(dc_ctl);
 
+static ssize_t thermal_mdis_fan_alarm_show(struct device *dev,
+				struct device_attribute *attr,
+				char *buf)
+{
+	struct gcpm_drv *gcpm = dev_get_drvdata(dev);
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", gcpm->thermal_device.therm_fan_alarm_level);
+}
+
+static ssize_t thermal_mdis_fan_alarm_store(struct device *dev,
+				 struct device_attribute *attr,
+				 const char *buf, size_t count)
+{
+	struct gcpm_drv *gcpm = dev_get_drvdata(dev);
+	int ret = 0;
+	u32 value;
+
+	ret = kstrtou32(buf, 0, &value);
+	if (ret < 0)
+		return ret;
+
+	if (value <= gcpm->thermal_device.thermal_levels)
+		gcpm->thermal_device.therm_fan_alarm_level = value;
+
+	return count;
+}
+static DEVICE_ATTR_RW(thermal_mdis_fan_alarm);
+
 /* ------------------------------------------------------------------------ */
 
 static int gcpm_get_max_charge_cntl_limit(struct thermal_cooling_device *tcd,
@@ -2337,6 +2367,40 @@ static int gcpm_get_cur_charge_cntl_limit(struct thermal_cooling_device *tcd,
 
 	*lvl = tdev->current_level;
 	return 0;
+}
+
+#define FAN_MDIS_ALARM_DEFAULT 3
+static int fan_get_level(struct mdis_thermal_device *tdev)
+{
+	int fan_level = FAN_LVL_UNKNOWN;
+
+	if (tdev->current_level <= 0)
+		fan_level = FAN_LVL_NOT_CARE;
+	else if (tdev->current_level >= tdev->therm_fan_alarm_level)
+		fan_level = FAN_LVL_ALARM;
+	else
+		fan_level = FAN_LVL_MED;
+
+	return fan_level;
+}
+
+static int gcpm_mdis_update_fan(struct gcpm_drv *gcpm)
+{
+	int ret = 0;
+
+	if (!gcpm->fan_level_votable)
+		gcpm->fan_level_votable = gvotable_election_get_handle(VOTABLE_FAN_LEVEL);
+
+	if (gcpm->fan_level_votable) {
+		const int level = fan_get_level(&gcpm->thermal_device);
+
+		ret = gvotable_cast_int_vote(gcpm->fan_level_votable, "THERMAL_MDIS",
+					     level, true);
+		if (ret < 0)
+			pr_err("%s: cannot update fan level (%d)", __func__, ret);
+	}
+
+	return ret;
 }
 
 static inline int mdis_cast_vote(struct gvotable_election *el, int vote, bool enabled)
@@ -2432,7 +2496,7 @@ static int gcpm_mdis_update_limits(struct gcpm_drv *gcpm, int msc_fcc,
 	if (dc_icl != 0 && dc_icl_votable) {
 		int wlc_state;
 
-		/* need to set online WLC if not onlne */
+		/* need to set online WLC if not online */
 		wlc_state = mdis_set_wlc_online(gcpm);
 		if (wlc_state == PPS_PSY_OFFLINE)
 			dev_err(gcpm->device, "MDIS: WLC offine\n");
@@ -2609,9 +2673,6 @@ static int gcpm_set_mdis_charge_cntl_limit(struct thermal_cooling_device *tcd,
 	return 0;
 }
 
-#define to_cooling_device(_dev)	\
-	container_of(_dev, struct thermal_cooling_device, device)
-
 static ssize_t
 state2power_table_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
@@ -2640,7 +2701,7 @@ mdis_out_table_show(struct device *dev, struct device_attribute *attr, char *buf
 	struct thermal_cooling_device *tdev = to_cooling_device(dev);
 	struct mdis_thermal_device *mdev = tdev->devdata;
 	struct gcpm_drv *gcpm = mdev->gcpm;
-	const int entries = mdev->thermal_levels * gcpm->mdis_out_count;
+	const int entries = mdev->thermal_levels * gcpm->mdis_in_count;
 	ssize_t count = 0;
 	int i, j;
 
@@ -2669,13 +2730,6 @@ static const struct thermal_cooling_device_ops chg_mdis_tcd_ops = {
 };
 
 #ifdef CONFIG_DEBUG_FS
-
-#define DEBUG_ATTRIBUTE_WO(name) \
-static const struct file_operations name ## _fops = {	\
-	.open	= simple_open,			\
-	.llseek	= no_llseek,			\
-	.write	= name ## _store,			\
-}
 
 static ssize_t mdis_tm_store(struct file *filp, const char __user *user_buf,
 			     size_t count, loff_t *ppos)
@@ -2745,7 +2799,7 @@ static ssize_t mdis_out_store(struct file *filp, const char __user *user_buf,
 		if (index < 0 || index >= levels)
 			break;
 
-		for (i = 0; i < levels * gcpm->mdis_out_count; i++) {
+		for (i = 0; i < levels * gcpm->mdis_in_count; i++) {
 			str = strsep(&saved_ptr, " ");
 			if (!str)
 				goto error_done;
@@ -2913,6 +2967,8 @@ static int gcpm_mdis_callback(struct gvotable_election *el, const char *reason,
 		}
 	}
 
+	gcpm_mdis_update_fan(gcpm);
+
 	if (!gcpm->csi_status_votable) {
 		gcpm->csi_status_votable = gvotable_election_get_handle(VOTABLE_CSI_STATUS);
 		if (!gcpm->csi_status_votable)
@@ -3019,7 +3075,7 @@ static int gcpm_init_mdis(struct gcpm_drv *gcpm)
 	 * mdis_out_sel mode.
 	 */
 	for (i = 0; i < gcpm->mdis_out_count; i++) {
-		int len = tdev->thermal_levels * gcpm->mdis_out_count;
+		int len = tdev->thermal_levels * gcpm->mdis_in_count;
 		char of_name[36];
 		u32 *limits;
 
@@ -3031,6 +3087,11 @@ static int gcpm_init_mdis(struct gcpm_drv *gcpm)
 
 		gcpm->mdis_out_limits[i] = limits;
 	}
+
+	ret = of_property_read_u32(gcpm->device->of_node, "google,mdis-fan-alarm-level",
+				   &tdev->therm_fan_alarm_level);
+	if (ret < 0)
+		tdev->therm_fan_alarm_level = FAN_MDIS_ALARM_DEFAULT;
 
 	/* mdis thermal engine uses this callback */
 	gcpm->mdis_votable =
@@ -4001,6 +4062,10 @@ static int google_cpm_probe(struct platform_device *pdev)
 	ret = device_create_file(gcpm->device, &dev_attr_dc_ctl);
 	if (ret)
 		dev_err(gcpm->device, "Failed to create dc_crl\n");
+
+	ret = device_create_file(gcpm->device, &dev_attr_thermal_mdis_fan_alarm);
+	if (ret)
+		dev_err(gcpm->device, "Failed to create thermal_mdis_fan_alarm\n");
 
 	/* give time to fg driver to start */
 	schedule_delayed_work(&gcpm->init_work,

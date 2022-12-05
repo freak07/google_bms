@@ -53,6 +53,9 @@
 #define RTX_BEN_ENABLED		2
 
 #define REENABLE_RTX_DELAY	3000
+#define P9XXX_CHK_RP_DELAY_MS	200
+
+#define P9XXX_VOUT_5480MV	5480
 
 enum wlc_align_codes {
 	WLC_ALIGN_CHECKING = 0,
@@ -457,7 +460,7 @@ static int p9221_send_csp(struct p9221_charger_data *charger, u8 stat)
 	}
 
 	if (charger->online) {
-		ret = p9221_reg_write_8(charger, P9221R5_CHARGE_STAT_REG, stat);
+		ret = p9221_reg_write_8(charger, charger->reg_csp_addr, stat);
 		if (ret == 0)
 			ret = charger->chip_set_cmd(charger, P9221R5_COM_SENDCSP);
 		if (ret < 0)
@@ -872,6 +875,7 @@ static void p9221_set_offline(struct p9221_charger_data *charger)
 	mutex_lock(&charger->stats_lock);
 	charger->online = false;
 	charger->online_at = 0;
+	charger->check_rp = RP_NOTSET;
 	cancel_delayed_work(&charger->charge_stats_work);
 	p9221_dump_charge_stats(charger);
 	mutex_unlock(&charger->stats_lock);
@@ -1062,7 +1066,7 @@ static void p9221_power_mitigation_work(struct work_struct *work)
 {
 	struct p9221_charger_data *charger = container_of(work,
 			struct p9221_charger_data, power_mitigation_work.work);
-	const u32 vout_5500mv = 5500;
+	int ret = 0;
 
 	charger->wait_for_online = false;
 
@@ -1077,17 +1081,19 @@ static void p9221_power_mitigation_work(struct work_struct *work)
 	}
 
 	if (!p9221_is_epp(charger)) {
-		if (charger->trigger_power_mitigation) {
-			dev_info(&charger->client->dev, "power_mitigate: change Vout to 5.5V\n");
-			charger->chip_set_vout_max(charger, vout_5500mv);
-			dev_info(&charger->client->dev, "power_mitigate: write 0 to 0xF4\n");
-			p9221_reg_write_8(charger, 0xF4, 0);
-			if (charger->ll_bpp_cep == 1)
-				p9221_ll_bpp_cep(charger, charger->last_capacity);
+		/* only for LL */
+		if (charger->trigger_power_mitigation && charger->ll_bpp_cep == 1) {
+			dev_info(&charger->client->dev,
+				 "power_mitigate: change Vout to %d mV and disable CMFET\n",
+				 P9XXX_VOUT_5480MV);
+			ret = charger->chip_set_vout_max(charger, P9XXX_VOUT_5480MV);
+			ret |= p9221_reg_write_8(charger, P9412_CMFET_L_REG, 0);
+			if (ret < 0)
+				dev_err(&charger->client->dev, "Fail to configure LL\n");
+			p9221_ll_bpp_cep(charger, charger->last_capacity);
 		}
 		charger->fod_cnt = 0;
-		dev_info(&charger->client->dev,
-			 "power_mitigate: already BPP\n");
+		dev_info(&charger->client->dev, "power_mitigate: already BPP\n");
 		return;
 	}
 
@@ -1137,19 +1143,20 @@ static void p9221_init_align(struct p9221_charger_data *charger)
 static void p9xxx_align_check(struct p9221_charger_data *charger)
 {
 	int res, wlc_freq_threshold;
-	u32 wlc_freq, current_scaling = 0;
+	u32 wlc_freq, current_scaling = 0, current_temp;
 
+	current_temp = (charger->current_filtered > 100) ? (charger->current_filtered - 100) : 0;
 	if (charger->current_filtered <= charger->pdata->alignment_current_threshold) {
 		current_scaling =
 			charger->pdata->alignment_scalar_low_current *
-			charger->current_filtered / 10;
+			current_temp / 10;
 		wlc_freq_threshold =
 			charger->pdata->alignment_offset_low_current +
 			current_scaling;
 	} else {
 		current_scaling =
 			charger->pdata->alignment_scalar_high_current *
-			charger->current_filtered / 10;
+			current_temp / 10;
 		wlc_freq_threshold =
 			charger->pdata->alignment_offset_high_current -
 			current_scaling;
@@ -2176,7 +2183,8 @@ static int p9221_set_psy_online(struct p9221_charger_data *charger, int online)
 		}
 
 		/* not there, must return not supp */
-		if (!charger->pdata->has_wlc_dc || !p9221_is_online(charger))
+		if (!charger->pdata->has_wlc_dc || !p9221_is_online(charger)
+		    || !p9221_is_epp(charger))
 			return -EOPNOTSUPP;
 
 		if (charger->last_capacity > WLC_HPP_SOC_LIMIT)
@@ -2328,15 +2336,22 @@ static void p9221_dream_defend(struct p9221_charger_data *charger)
 
 static void p9221_ll_check_chg_term(struct p9221_charger_data *charger, int capacity)
 {
+	int ll_icl_ua;
+
+	ll_icl_ua = gvotable_get_int_vote(charger->dc_icl_votable, LL_BPP_CEP_VOTER);
+
 	if (capacity < 97) {
+		if (ll_icl_ua == P9221_LL_BPP_CHG_TERM_UA)
+			dev_info(&charger->client->dev, "power_mitigate: remove LL_BPP_CEP_VOTER(capacity=%d)\n",
+				 capacity);
 		gvotable_cast_int_vote(charger->dc_icl_votable, LL_BPP_CEP_VOTER, 0, false);
-		dev_dbg(&charger->client->dev, "power_mitigate: remove LL_BPP_CEP_VOTER\n");
 	} else if (capacity == 101) {
 		/* when gdf==100, it's chg_term and vote 200mA */
+		if (ll_icl_ua != P9221_LL_BPP_CHG_TERM_UA)
+			dev_info(&charger->client->dev, "power_mitigate: LL_BPP vote DC_ICL=%duA(capacity=%d)\n",
+				 P9221_LL_BPP_CHG_TERM_UA, capacity);
 		gvotable_cast_int_vote(charger->dc_icl_votable, LL_BPP_CEP_VOTER,
 				       P9221_LL_BPP_CHG_TERM_UA, true);
-		dev_dbg(&charger->client->dev, "power_mitigate: vote DC_ICL=%duA\n",
-			 P9221_LL_BPP_CHG_TERM_UA);
 	}
 }
 
@@ -2358,9 +2373,9 @@ static void p9221_ll_bpp_cep(struct p9221_charger_data *charger, int capacity)
 	p9221_ll_check_chg_term(charger, capacity);
 
 	if (icl_ua > 0)
-		dev_info(&charger->client->dev,
-			 "power_mitigate: set ICL to %duA\n",
-			 gvotable_get_current_int_vote(charger->dc_icl_votable));
+		dev_dbg(&charger->client->dev,
+			"power_mitigate: DD vote ICL = %duA\n",
+			gvotable_get_int_vote(charger->dc_icl_votable, DD_VOTER));
 }
 
 /*
@@ -2632,7 +2647,8 @@ static int p9221_enable_interrupts(struct p9221_charger_data *charger)
 		mask = charger->ints.stat_rtx_mask;
 	} else {
 		mask = charger->ints.stat_limit_mask | charger->ints.stat_cc_mask |
-		       charger->ints.vrecton_bit | charger->ints.prop_mode_mask;
+		       charger->ints.vrecton_bit | charger->ints.prop_mode_mask |
+		       charger->ints.extended_mode_bit;
 
 		if (charger->pdata->needs_dcin_reset ==
 						P9221_WC_DC_RESET_VOUTCHANGED)
@@ -2705,6 +2721,13 @@ static int p9221_set_dc_icl(struct p9221_charger_data *charger)
 				"Could not get votable: DC_ICL\n");
 			return -ENODEV;
 		}
+	}
+
+	if (!p9221_is_epp(charger) && charger->last_capacity == 100 && charger->ll_bpp_cep < 0) {
+		dev_info(&charger->client->dev, "vote ICL as %d for BPP mode(capacity=%d)\n",
+			 P9221_LL_BPP_CHG_TERM_UA, charger->last_capacity);
+		gvotable_cast_int_vote(charger->dc_icl_votable, LL_BPP_CEP_VOTER,
+				       P9221_LL_BPP_CHG_TERM_UA, true);
 	}
 
 	/* Default to BPP ICL */
@@ -2921,6 +2944,39 @@ static void p9221_icl_ramp_start(struct p9221_charger_data *charger)
 			     ms_to_ktime(charger->pdata->icl_ramp_delay_ms));
 }
 
+static void p9xxx_check_ll_bpp_cep(struct p9221_charger_data *charger)
+{
+	int ret, ll_icl_ua;
+	u32 vout_mv = 0;
+	u8 val8 = 0;
+	bool is_ll_bpp = true;
+
+	ll_icl_ua = gvotable_get_int_vote(charger->dc_icl_votable, LL_BPP_CEP_VOTER);
+
+	if (ll_icl_ua <= 0 || charger->ll_bpp_cep == 1)
+		return;
+
+	if (p9221_is_epp(charger))
+		is_ll_bpp = false;
+
+	ret = charger->chip_get_vout_max(charger, &vout_mv);
+	if (ret < 0 || vout_mv != P9XXX_VOUT_5480MV)
+		is_ll_bpp = false;
+	ret = p9221_reg_read_8(charger, P9412_CMFET_L_REG, &val8);
+	if (ret < 0 || val8 != 0)
+		is_ll_bpp = false;
+
+	if (is_ll_bpp) {
+		charger->ll_bpp_cep = 1;
+		dev_info(&charger->client->dev, "ll_bpp_cep = %d\n", charger->ll_bpp_cep);
+	} else {
+		charger->ll_bpp_cep = 0;
+		dev_info(&charger->client->dev,
+			 "remove LL_BPP_CEP_VOTER(capacity=%d)\n", charger->last_capacity);
+		gvotable_cast_int_vote(charger->dc_icl_votable, LL_BPP_CEP_VOTER, 0, false);
+	}
+}
+
 static void p9221_set_online(struct p9221_charger_data *charger)
 {
 	int ret;
@@ -2942,15 +2998,6 @@ static void p9221_set_online(struct p9221_charger_data *charger)
 
 	p9221_charge_stats_init(&charger->chg_data);
 	mutex_unlock(&charger->stats_lock);
-
-	if (charger->chip_id == P9222_CHIP_ID &&
-	    !p9221_is_epp(charger)) {
-		dev_err(&charger->client->dev, "P9222 change VOUT to 5V\n");
-		ret = p9221_set_bpp_vout(charger);
-		if (ret)
-			dev_err(&charger->client->dev,
-				"cannot change VOUT (%d)\n", ret);
-	}
 
 	ret = p9221_reg_read_8(charger, P9221_CUSTOMER_ID_REG, &cid);
 	if (ret)
@@ -3097,7 +3144,7 @@ static void p9221_notifier_check_dc(struct p9221_charger_data *charger)
 {
 	int ret, dc_in;
 
-	if ((charger->chip_id < P9382A_CHIP_ID) && charger->check_np) {
+	if ((charger->chip_id == P9221_CHIP_ID) && charger->check_np) {
 
 		ret = p9221_notifier_check_neg_power(charger);
 		if (ret > 0) {
@@ -3163,6 +3210,9 @@ static void p9221_notifier_check_dc(struct p9221_charger_data *charger)
 		if (!charger->dc_icl_bpp)
 			p9221_icl_ramp_start(charger);
 
+		/* Check if Tx in LL BPP mode */
+		p9xxx_check_ll_bpp_cep(charger);
+
 		ret = p9221_reg_read_16(charger, P9221_OTP_FW_MINOR_REV_REG,
 					&charger->fw_rev);
 		if (ret)
@@ -3226,9 +3276,7 @@ static void p9xxx_write_q_factor(struct p9221_charger_data *charger)
 	q_factor = (charger->de_q_value > 0) ?
 		   charger->de_q_value : charger->pdata->q_value;
 
-	ret = p9221_reg_write_8(charger,
-				P9221R5_EPP_Q_FACTOR_REG,
-				q_factor);
+	ret = p9xxx_chip_set_q_factor_reg(charger, q_factor);
 	if (ret < 0)
 		dev_err(&charger->client->dev,
 			"cannot write Q=%d (%d)\n",
@@ -3247,9 +3295,7 @@ static void p9xxx_update_q_factor(struct p9221_charger_data *charger)
 	}
 
 	if (charger->mfg == P9221_PTMC_EPP_TX_4191) {
-		ret = p9221_reg_write_8(charger,
-					P9221R5_EPP_Q_FACTOR_REG,
-					charger->pdata->tx_4191q);
+		ret = p9xxx_chip_set_q_factor_reg(charger, charger->pdata->tx_4191q);
 		if (ret == 0)
 			dev_info(&charger->client->dev,
 				 "update Q factor=%d(mfg=%x)\n",
@@ -3838,6 +3884,10 @@ static ssize_t p9221_store_txlen(struct device *dev,
 	if (!charger->online)
 		return -ENODEV;
 
+	/* Don't send bidi data in cases of BPP and NOT dream-defend */
+	if (!p9221_is_epp(charger) && !charger->trigger_power_mitigation)
+		return -EINVAL;
+
 	charger->tx_len = len;
 
 	ret = set_renego_state(charger, P9XXX_SEND_DATA);
@@ -4205,6 +4255,10 @@ static ssize_t wpc_ready_show(struct device *dev,
 {
 	struct i2c_client *client = to_i2c_client(dev);
 	struct p9221_charger_data *charger = i2c_get_clientdata(client);
+
+	/* Skip it on BPP */
+	if (!p9221_is_epp(charger) || !charger->pdata->has_wlc_dc)
+		return scnprintf(buf, PAGE_SIZE, "N\n");
 
 	return scnprintf(buf, PAGE_SIZE, "%c\n",
 			 p9412_is_calibration_done(charger) ? 'Y' : 'N');
@@ -4629,8 +4683,6 @@ static int p9382_set_rtx(struct p9221_charger_data *charger, bool enable)
 	mutex_lock(&charger->rtx_lock);
 
 	if (enable == 0) {
-		logbuffer_log(charger->rtx_log, "disable rtx\n");
-
 		if (charger->is_rtx_mode) {
 			ret = charger->chip_tx_mode_en(charger, false);
 			charger->is_rtx_mode = false;
@@ -4643,6 +4695,9 @@ static int p9382_set_rtx(struct p9221_charger_data *charger, bool enable)
 		if (ret)
 			dev_err(&charger->client->dev,
 				"fail to enable dcin, ret=%d\n", ret);
+
+		logbuffer_log(charger->rtx_log, "disable rtx\n");
+
 		goto done;
 	} else {
 		logbuffer_log(charger->rtx_log, "enable rtx");
@@ -4696,7 +4751,7 @@ static int p9382_set_rtx(struct p9221_charger_data *charger, bool enable)
 			dev_err(&charger->client->dev,
 				"cannot enter rTX mode (%d)\n", ret);
 			logbuffer_log(charger->rtx_log,
-				      "cannot enter rTX mode (%d)\n", ret);
+				      "cannot enter rTX mode (%d)", ret);
 			p9382_ben_cfg(charger, RTX_BEN_DISABLED);
 
 			ret = p9382_disable_dcin_en(charger, false);
@@ -4757,6 +4812,75 @@ done:
 	return ret;
 }
 
+#define P9412_RTX_OCP_THRES_MA		900
+static int p9412_check_rtx_ocp(struct p9221_charger_data *chgr)
+{
+	int ret, cnt, retry, ocp_count = 0, current_now, chk_ms, total_delay;
+	u16 status_reg;
+
+	total_delay = chgr->rtx_total_delay > 0 ? chgr->rtx_total_delay : 3000;
+	chk_ms = chgr->rtx_ocp_chk_ms > 0 ? chgr->rtx_ocp_chk_ms : 20;
+	retry = (total_delay / chk_ms > 0) ? (total_delay / chk_ms) : 1;
+
+	logbuffer_log(chgr->rtx_log, "use rtx_ocp_chk_ms=%d retry=%d", chk_ms, retry);
+
+	for (cnt = 0; cnt < retry; cnt++) {
+		/* check if rx_is_connected: if yes, goto 7V */
+		ret = chgr->reg_read_16(chgr, P9221_STATUS_REG, &status_reg);
+		if (ret < 0) {
+			logbuffer_log(chgr->rtx_log, "goto disable RTx(%d)", ret);
+			return -EIO;
+		}
+		if (status_reg & chgr->ints.rx_connected_bit) {
+			logbuffer_log(chgr->rtx_log, "rx is connected, goto 7V");
+			return 0;
+		}
+		/* check if (ocp_cnt > 2): if yes, disable rtx */
+		ret = chgr->chip_get_iout(chgr, &current_now);
+		if (ret == 0 && current_now > P9412_RTX_OCP_THRES_MA) {
+			ocp_count++;
+			logbuffer_log(chgr->rtx_log, "cnt=%d,current_now=%d,ocp_count=%d",
+				      cnt, current_now, ocp_count);
+		}
+		if (ret < 0) {
+			logbuffer_log(chgr->rtx_log, "iout disable RTx(%d)", ret);
+			return -EINVAL;
+		}
+		if (ocp_count > 2 || current_now == 0) {
+			logbuffer_log(chgr->rtx_log, "ocp_count=%d current_now=%d disable RTx",
+				      ocp_count, current_now);
+			return -EINVAL;
+		}
+		usleep_range(chk_ms * USEC_PER_MSEC, (chk_ms + 2) * USEC_PER_MSEC);
+	}
+
+	return 0;
+}
+
+static void p9412_chk_rtx_ocp_work(struct work_struct *work)
+{
+	struct p9221_charger_data *chgr = container_of(work,
+			struct p9221_charger_data, chk_rtx_ocp_work.work);
+	int ret;
+
+	/* check TX OCP before enable 7V */
+	ret = p9412_check_rtx_ocp(chgr);
+	if (ret < 0) {
+		p9382_set_rtx(chgr, false);
+		return;
+	}
+
+	ret = chgr->reg_write_8(chgr, P9412_APBSTPING_REG, P9412_APBSTPING_7V);
+	ret |= chgr->reg_write_8(chgr, P9412_APBSTCONTROL_REG, P9412_APBSTPING_7V);
+	if (ret == 0) {
+		schedule_delayed_work(&chgr->rtx_work, msecs_to_jiffies(P9382_RTX_TIMEOUT_MS));
+	} else {
+		logbuffer_log(chgr->rtx_log, "Failed to configure Ext-Boost Vout registers(%d)",
+			      ret);
+		p9382_set_rtx(chgr, false);
+	}
+}
+
 static ssize_t rtx_show(struct device *dev,
 			struct device_attribute *attr,
 			char *buf)
@@ -4781,6 +4905,9 @@ static ssize_t rtx_store(struct device *dev,
 	if (buf[0] == '0') {
 		dev_info(&charger->client->dev, "battery share off\n");
 		logbuffer_log(charger->rtx_log, "battery share off");
+		cancel_delayed_work_sync(&charger->rtx_work);
+		if (charger->pdata->apbst_en)
+			cancel_delayed_work_sync(&charger->chk_rtx_ocp_work);
 		charger->rtx_reset_cnt = 0;
 		ret = p9382_set_rtx(charger, false);
 	} else if (buf[0] == '1') {
@@ -5136,12 +5263,9 @@ static void p9xxx_reset_rtx_for_ocp(struct p9221_charger_data *charger)
 {
 	int ext_bst_on = 0;
 
-	if (charger->pdata->ben_gpio > 0)
-		ext_bst_on = gpio_get_value_cansleep(charger->pdata->ben_gpio);
-
 	charger->rtx_reset_cnt += 1;
 
-	if ((charger->rtx_reset_cnt >= RTX_RESET_COUNT_MAX) || ext_bst_on) {
+	if (charger->rtx_reset_cnt >= RTX_RESET_COUNT_MAX) {
 		if (charger->rtx_reset_cnt == RTX_RESET_COUNT_MAX)
 			charger->rtx_err = RTX_HARD_OCP;
 		charger->rtx_reset_cnt = 0;
@@ -5151,6 +5275,11 @@ static void p9xxx_reset_rtx_for_ocp(struct p9221_charger_data *charger)
 	p9382_set_rtx(charger, false);
 
 	msleep(REENABLE_RTX_DELAY);
+
+	if (charger->pdata->ben_gpio > 0)
+		ext_bst_on = gpio_get_value_cansleep(charger->pdata->ben_gpio);
+	if (ext_bst_on)
+		return;
 
 	if (charger->rtx_reset_cnt) {
 		dev_info(&charger->client->dev, "re-enable RTx mode, cnt=%d\n", charger->rtx_reset_cnt);
@@ -5220,8 +5349,8 @@ static void rtx_irq_handler(struct p9221_charger_data *charger, u16 irq_src)
 		if (mode_reg == P9XXX_SYS_OP_MODE_TX_MODE) {
 			charger->is_rtx_mode = true;
 			cancel_delayed_work_sync(&charger->rtx_work);
-			schedule_delayed_work(&charger->rtx_work,
-				    msecs_to_jiffies(P9382_RTX_TIMEOUT_MS));
+			if (!charger->pdata->apbst_en)
+				schedule_delayed_work(&charger->rtx_work, msecs_to_jiffies(P9382_RTX_TIMEOUT_MS));
 		}
 		dev_info(&charger->client->dev,
 			 "P9221_SYSTEM_MODE_REG reg: %02x\n",
@@ -5283,12 +5412,9 @@ static void rtx_irq_handler(struct p9221_charger_data *charger, u16 irq_src)
 	}
 
 	if (irq_src & csp_bit) {
-		ret = p9221_reg_read_8(charger, P9382A_CHARGE_STAT_REG,
-				       &csp_reg);
+		ret = p9221_reg_read_8(charger, charger->reg_csp_addr, &csp_reg);
 		if (ret) {
-			logbuffer_log(charger->rtx_log,
-				      "failed to read CSP_REG reg: %d",
-				      ret);
+			logbuffer_log(charger->rtx_log, "failed to read CSP_REG reg: %d", ret);
 		} else {
 			charger->rtx_csp = csp_reg;
 			schedule_work(&charger->uevent_work);
@@ -5533,6 +5659,18 @@ static void p9221_irq_handler(struct p9221_charger_data *charger, u16 irq_src)
 
 		/* charger->prop_mode_en is reset on disconnect */
 	}
+
+	/* This only necessary for P9222 */
+	if (irq_src & charger->ints.extended_mode_bit) {
+		if (charger->check_rp == RP_NOTSET &&
+		    charger->pdata->epp_rp_value != -1) {
+			pm_stay_awake(charger->dev);
+			charger->check_rp = RP_CHECKING;
+			cancel_delayed_work_sync(&charger->chk_rp_work);
+			schedule_delayed_work(&charger->chk_rp_work,
+					      msecs_to_jiffies(P9XXX_CHK_RP_DELAY_MS));
+		}
+	}
 }
 
 #define IRQ_DEBOUNCE_TIME_MS		4
@@ -5648,6 +5786,16 @@ static irqreturn_t p9221_irq_det_thread(int irq, void *irq_data)
 
 	return IRQ_HANDLED;
 }
+
+static void p9xxx_chk_rp_work(struct work_struct *work)
+{
+	struct p9221_charger_data *charger = container_of(work,
+			struct p9221_charger_data, chk_rp_work.work);
+
+	charger->chip_renegotiate_pwr(charger);
+	pm_relax(charger->dev);
+}
+
 
 static void p9382_rtx_disable_work(struct work_struct *work)
 {
@@ -5985,6 +6133,14 @@ static int p9221_parse_dt(struct device *dev,
 		dev_info(dev, "dt epp_rp_value: %d\n", pdata->epp_rp_value);
 	}
 
+	ret = of_property_read_u32(node, "google,epp_rp_low_value", &data);
+	if (ret < 0) {
+		pdata->epp_rp_low_value = -1;
+	} else {
+		pdata->epp_rp_low_value = data;
+		dev_info(dev, "dt epp_rp_low_value: %d\n", pdata->epp_rp_low_value);
+	}
+
 	pdata->epp_vout_mv = P9221_MAX_VOUT_SET_MV_DEFAULT;
 	ret = of_property_read_u32(node, "google,epp_vout_mv", &data);
 	if (ret == 0) {
@@ -6129,6 +6285,12 @@ static int p9221_parse_dt(struct device *dev,
 				  &pdata->phone_type);
 	if (ret < 0)
 		pdata->phone_type = 0;
+
+	ret = of_property_read_u32(node, "google,epp_dcicl_default_ma", &data);
+	if (ret < 0)
+		pdata->epp_icl = 0;
+	else
+		pdata->epp_icl = data;
 
 	return 0;
 }
@@ -6281,7 +6443,7 @@ static void p9221_fg_work(struct work_struct *work)
 		err = power_supply_get_by_phandle_array(charger->dev->of_node,
 							"idt,fuel-gauge",
 							psy, ARRAY_SIZE(psy));
-		if (err < 0) {
+		if (err < 0 || IS_ERR_OR_NULL(psy[0])) {
 			schedule_delayed_work(&charger->fg_work, msecs_to_jiffies(1000));
 			pr_info("%s: wait for fg err=%d\n", __func__, err);
 			return;
@@ -6354,6 +6516,7 @@ static int p9221_charger_probe(struct i2c_client *client,
 	charger->last_disable = -1;
 	charger->irq_at = 0;
 	charger->ll_bpp_cep = -EINVAL;
+	charger->check_rp = RP_NOTSET;
 	mutex_init(&charger->io_lock);
 	mutex_init(&charger->cmd_lock);
 	mutex_init(&charger->stats_lock);
@@ -6373,6 +6536,8 @@ static int p9221_charger_probe(struct i2c_client *client,
 	INIT_DELAYED_WORK(&charger->rtx_work, p9382_rtx_work);
 	INIT_DELAYED_WORK(&charger->auth_dc_icl_work, p9221_auth_dc_icl_work);
 	INIT_DELAYED_WORK(&charger->fg_work, p9221_fg_work);
+	INIT_DELAYED_WORK(&charger->chk_rp_work, p9xxx_chk_rp_work);
+	INIT_DELAYED_WORK(&charger->chk_rtx_ocp_work, p9412_chk_rtx_ocp_work);
 	INIT_WORK(&charger->uevent_work, p9221_uevent_work);
 	INIT_WORK(&charger->rtx_disable_work, p9382_rtx_disable_work);
 	INIT_WORK(&charger->rtx_reset_work, p9xxx_rtx_reset_work);
@@ -6522,7 +6687,7 @@ static int p9221_charger_probe(struct i2c_client *client,
 
 	charger->dc_icl_bpp = 0;
 	charger->dc_icl_epp = 0;
-	charger->dc_icl_epp_neg = P9221_DC_ICL_EPP_UA;
+	charger->dc_icl_epp_neg = charger->pdata->epp_icl > 0 ? charger->pdata->epp_icl : P9221_DC_ICL_EPP_UA;
 	charger->aicl_icl_ua = 0;
 	charger->aicl_delay_ms = 0;
 
@@ -6598,6 +6763,8 @@ static int p9221_charger_probe(struct i2c_client *client,
 	} else {
 		debugfs_create_bool("no_fod", 0644, charger->debug_entry, &charger->no_fod);
 		debugfs_create_u32("de_q_value", 0644, charger->debug_entry, &charger->de_q_value);
+		debugfs_create_u32("de_chk_ocp_ms", 0644, charger->debug_entry, &charger->rtx_ocp_chk_ms);
+		debugfs_create_u32("de_rtx_delay_ms", 0644, charger->debug_entry, &charger->rtx_total_delay);
 	}
 
 	/* can independently read battery capacity */
@@ -6677,6 +6844,8 @@ static int p9221_charger_remove(struct i2c_client *client)
 	cancel_delayed_work_sync(&charger->align_work);
 	cancel_delayed_work_sync(&charger->rtx_work);
 	cancel_delayed_work_sync(&charger->auth_dc_icl_work);
+	cancel_delayed_work_sync(&charger->chk_rp_work);
+	cancel_delayed_work_sync(&charger->chk_rtx_ocp_work);
 	cancel_work_sync(&charger->uevent_work);
 	cancel_work_sync(&charger->rtx_disable_work);
 	cancel_work_sync(&charger->rtx_reset_work);
@@ -6770,7 +6939,6 @@ static struct i2c_driver p9221_charger_driver = {
 	.id_table	= p9221_charger_id_table,
 };
 module_i2c_driver(p9221_charger_driver);
-MODULE_SOFTDEP("pre: max1720x_battery");
 MODULE_DESCRIPTION("IDT P9221 Wireless Power Receiver Driver");
 MODULE_AUTHOR("Patrick Tjin <pattjin@google.com>");
 MODULE_LICENSE("GPL");

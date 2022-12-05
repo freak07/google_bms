@@ -307,6 +307,7 @@ struct batt_chg_health {
 	ktime_t rest_deadline;	/* full by this in seconds */
 	ktime_t dry_run_deadline; /* full by this in seconds (prediction) */
 	int rest_rate;		/* centirate once enter */
+	int rest_rate_before_trigger;
 
 	enum chg_health_state rest_state;
 	int rest_cc_max;
@@ -507,6 +508,8 @@ int ttf_ref_cc(const struct batt_ttf_stats *stats, int soc);
 
 int ttf_pwr_ibatt(const struct gbms_ce_tier_stats *ts);
 
+void ttf_tier_reset(struct batt_ttf_stats *stats);
+
 int gbms_read_aacr_limits(struct gbms_chg_profile *profile,
 			  struct device_node *node);
 
@@ -525,6 +528,8 @@ enum gbms_charger_modes {
 	GBMS_USB_OTG_FRS_ON	= 0x32,
 
 	GBMS_CHGR_MODE_WLC_TX	= 0x40,
+
+	GBMS_CHGR_MODE_VOUT	= 0x50,
 };
 
 #define GBMS_MODE_VOTABLE "CHARGER_MODE"
@@ -547,6 +552,7 @@ enum bhi_algo {
 	 */
 
 	BHI_ALGO_MIX_N_MATCH 	= 6,
+	BHI_ALGO_DEBUG		= 7,
 	BHI_ALGO_MAX,
 };
 
@@ -556,6 +562,12 @@ enum bhi_status {
 	BH_MARGINAL,
 	BH_NEEDS_REPLACEMENT,
 	BH_FAILED,
+};
+
+struct bhi_weight {
+	int w_ci;
+	int w_ii;
+	int w_sd;
 };
 
 /* Charging Speed */
@@ -588,6 +600,15 @@ enum csi_status {
 	CSI_STATUS_Charging = 200,	// All good
 };
 
+#define to_cooling_device(_dev)	\
+	container_of(_dev, struct thermal_cooling_device, device)
+
+#define DEBUG_ATTRIBUTE_WO(name) \
+static const struct file_operations name ## _fops = {	\
+	.open	= simple_open,			\
+	.llseek	= no_llseek,			\
+	.write	= name ## _store,			\
+}
 
 
 #endif  /* __GOOGLE_BMS_H_ */

@@ -287,17 +287,32 @@
  */
 #define P9222_CHIP_ID				0x9222
 #define P9222RE_SYSTEM_MODE_REG			0x3F
+#define P9222RE_CHARGE_STAT_REG			0x4E
+#define P9222RE_EPT_REG				0x4F
 #define P9222RE_VOUT_REG			0x50
 #define P9222RE_VOUT_SET_REG			0x52
 #define P9222RE_VRECT_REG			0x54
 #define P9222RE_IOUT_REG			0x58
 #define P9222RE_DIE_TEMP_REG			0x5A
 #define P9222RE_OP_FREQ_REG			0x5C
+#define P9222RE_TX_PINGFREQ_REG			0x5E
 #define P9222RE_ILIM_SET_REG			0x60
-#define P9222_COM_REG				0x62
+#define P9222RE_COM_REG				0x62
 #define P9222RE_FOD_REG				0x84
+#define P9222RE_COM_CHAN_RECV_SIZE_REG		0x98
+#define P9222RE_EPP_TX_GUARANTEED_POWER_REG	0xB4
 #define P9222RE_EPP_REQ_NEGOTIATED_POWER_REG	0xBD
+#define P9222RE_EPP_REQ_MAXIMUM_POWER_REG	0xBE
+#define P9222RE_EPP_Q_FACTOR_REG		0xD2
 #define P9222RE_TX_MFG_CODE_REG			0x106
+#define P9222RE_PROP_TX_ID_REG			0x118
+#define P9222RE_DIE_TEMP_ADC_REG		0x12A
+#define P9222RE_COM_PACKET_TYPE_ADDR		0x600
+#define P9222RE_COM_CHAN_SEND_SIZE_REG		0x601
+#define P9222RE_DATA_BUF_START			0x604
+#define P9222RE_DATA_BUF_SIZE			0x100
+
+#define P9222RE_COM_CCACTIVATE			BIT(9)
 
 /*
  * P9222 SYSTEM_MODE_REG bits
@@ -307,7 +322,7 @@
 
 #define P9222_VOUT_SET_MIN_MV			3500
 #define P9222_VOUT_SET_MAX_MV			12500
-
+#define P9222_NEG_POWER_10W			10000
 
 /*
  * Interrupt/Status flags for P9222
@@ -316,6 +331,7 @@
 #define P9222_STAT_OVT				BIT(2)
 #define P9222_STAT_OVC				BIT(3)
 #define P9222_STAT_OVV				BIT(4)
+#define P9222_EXTENDED_MODE			BIT(12)
 #define P9222_STAT_PPRCVD			BIT(15)
 
 /*
@@ -484,7 +500,10 @@
 
 /* p9412 AP BOOST PING register */
 #define P9412_APBSTPING_REG			0xF0
+#define P9412_APBSTCONTROL_REG			0xF1
 #define P9412_APBSTPING_7V			BIT(0)
+#define P9412_TXOCP_REG				0xA0
+#define P9412_TXOCP_1400MA			1400
 
 /* Features */
 typedef enum {
@@ -507,6 +526,12 @@ enum p9221_align_mfg_chk_state {
 	ALIGN_MFG_FAILED = -1,
 	ALIGN_MFG_CHECKING,
 	ALIGN_MFG_PASSED,
+};
+
+enum p9xxx_chk_rp {
+	RP_NOTSET = -1,
+	RP_CHECKING,
+	RP_DONE,
 };
 
 #define WLC_SOC_STATS_LEN      101
@@ -592,6 +617,7 @@ struct p9221_charger_platform_data {
 	int				q_value;
 	int				tx_4191q;
 	int				epp_rp_value;
+	int				epp_rp_low_value;
 	int				needs_dcin_reset;
 	int				nb_alignment_freq;
 	int				*alignment_freq;
@@ -612,6 +638,7 @@ struct p9221_charger_platform_data {
 	bool				has_sw_ramp;
 	/* phone type for tx_id*/
 	u8				phone_type;
+	u32				epp_icl;
 };
 
 struct p9221_charger_ints_bit {
@@ -634,6 +661,7 @@ struct p9221_charger_ints_bit {
 	u16				stat_limit_mask;
 	u16				stat_cc_mask;
 	u16				prop_mode_mask;
+	u16				extended_mode_bit;
 	/* Tx mode */
 	u16				hard_ocp_bit;
 	u16				tx_conflict_bit;
@@ -675,6 +703,8 @@ struct p9221_charger_data {
 	struct delayed_work		power_mitigation_work;
 	struct delayed_work		auth_dc_icl_work;
 	struct delayed_work		fg_work;
+	struct delayed_work		chk_rp_work;
+	struct delayed_work		chk_rtx_ocp_work;
 	struct work_struct		uevent_work;
 	struct work_struct		rtx_disable_work;
 	struct work_struct		rtx_reset_work;
@@ -748,6 +778,8 @@ struct p9221_charger_data {
 	u32				rtx_csp;
 	int				rtx_err;
 	int				rtx_reset_cnt;
+	int				rtx_ocp_chk_ms;
+	int				rtx_total_delay;
 	bool				chg_on_rtx;
 	bool				is_rtx_mode;
 	bool				prop_mode_en;
@@ -778,6 +810,7 @@ struct p9221_charger_data {
 	bool				sw_ramp_done;
 	bool				hpp_hv;
 	int				fod_mode;
+	enum p9xxx_chk_rp		check_rp;
 
 #if IS_ENABLED(CONFIG_GPIOLIB)
 	struct gpio_chip gpio;
@@ -795,6 +828,8 @@ struct p9221_charger_data {
 	u16				reg_set_pp_buf_addr;
 	u16				reg_get_pp_buf_addr;
 	u16				reg_set_fod_addr;
+	u16				reg_q_factor_addr;
+	u16				reg_csp_addr;
 
 	int (*reg_read_n)(struct p9221_charger_data *chgr, u16 reg,
 			  void *buf, size_t n);
@@ -908,5 +943,6 @@ enum p9xxx_renego_state {
       -ENOTSUPP : chgr->reg_write_n(chgr, chgr->reg_set_fod_addr, data, len))
 #define p9xxx_chip_get_fod_reg(chgr, data, len) (chgr->reg_set_fod_addr == 0 ? \
       -ENOTSUPP : chgr->reg_read_n(chgr, chgr->reg_set_fod_addr, data, len))
-
+#define p9xxx_chip_set_q_factor_reg(chgr, data) (chgr->reg_q_factor_addr == 0 ? \
+      -ENOTSUPP : chgr->reg_write_8(chgr, chgr->reg_q_factor_addr, data))
 #endif /* __P9221_CHARGER_H__ */

@@ -588,6 +588,13 @@ static int max77759_foreach_callback(void *data, const char *reason,
 		pr_debug("%s: WLC_TX vote=%x\n", __func__, mode);
 		cb_data->wlc_tx += 1;
 		break;
+	/* pogo vout */
+	case GBMS_CHGR_MODE_VOUT:
+		if (!cb_data->pogo_vout)
+			cb_data->reason = reason;
+		pr_debug("%s: VOUT vote=%x\n", __func__, mode);
+		cb_data->pogo_vout += 1;
+		break;
 
 	default:
 		pr_err("mode=%x not supported\n", mode);
@@ -637,7 +644,10 @@ static int max77759_get_otg_usecase(struct max77759_foreach_cb_data *cb_data)
 	}
 
 	/* pure OTG defaults to ext boost */
-	if (!cb_data->wlc_rx && !cb_data->wlc_tx) {
+	if (cb_data->pogo_vout) {
+		usecase = GSU_MODE_USB_OTG_POGO_VOUT;
+		mode = MAX77759_CHGR_MODE_OTG_BOOST_ON;
+	} else if (!cb_data->wlc_rx && !cb_data->wlc_tx) {
 		/* 5-1: USB_OTG or  5-2: USB_OTG_FRS */
 
 		if (cb_data->frs_on) {
@@ -724,6 +734,19 @@ static int max77759_get_usecase(struct max77759_foreach_cb_data *cb_data,
 		/* USB+WLC for factory and testing */
 		usecase = GSU_MODE_USB_WLC_RX;
 		mode = MAX77759_CHGR_MODE_CHGR_BUCK_ON;
+	} else if (cb_data->pogo_vout) {
+
+		if (!buck_on) {
+			mode = MAX77759_CHGR_MODE_ALL_OFF;
+			usecase = GSU_MODE_POGO_VOUT;
+		} else if (chgr_on) {
+			mode = MAX77759_CHGR_MODE_CHGR_BUCK_ON;
+			usecase = GSU_MODE_USB_CHG_POGO_VOUT;
+		} else {
+			mode = MAX77759_CHGR_MODE_BUCK_ON;
+			usecase = GSU_MODE_USB_CHG_POGO_VOUT;
+		}
+
 	} else if (!buck_on && !wlc_rx) {
 		mode = MAX77759_CHGR_MODE_ALL_OFF;
 
@@ -860,12 +883,21 @@ static int max77759_set_insel(struct max77759_chgr_data *data,
 		force_wlc = true;
 	}
 
-	/* always disable USB when Dock is present */
-	if (uc_data->dcin_is_dock && max77759_wcin_is_valid(data) && !cb_data->wlcin_off) {
-		insel_value &= ~MAX77759_CHG_CNFG_12_CHGINSEL;
-		/* b/202767016: charge over pogo, set to high */
+	if (cb_data->pogo_vout) {
+		/* always disable WCIN when pogo power out */
+		insel_value &= ~MAX77759_CHG_CNFG_12_WCINSEL;
+		/* turn off pogo_ovp */
 		if (uc_data->pogo_ovp_en > 0)
-			gpio_set_value_cansleep(uc_data->pogo_ovp_en, 1);
+			gpio_set_value_cansleep(uc_data->pogo_ovp_en, uc_data->pogo_ovp_en_act_low);
+	} else if (uc_data->dcin_is_dock && max77759_wcin_is_valid(data) && !cb_data->wlcin_off) {
+		/* always disable USB when Dock is present */
+		insel_value &= ~MAX77759_CHG_CNFG_12_CHGINSEL;
+		/* b/232723240: charge over USB-C
+		 *              set to 1 for POGO_OVP_EN
+		 *              set to 0 for POGO_OVP_EN_L
+		 */
+		if (uc_data->pogo_ovp_en > 0)
+			gpio_set_value_cansleep(uc_data->pogo_ovp_en, !uc_data->pogo_ovp_en_act_low);
 		insel_value |= MAX77759_CHG_CNFG_12_WCINSEL;
 	}
 
@@ -1027,7 +1059,7 @@ static int max77759_mode_callback(struct gvotable_election *el,
 	       !cb_data.chgr_on && !cb_data.buck_on && ! cb_data.boost_on &&
 	       !cb_data.otg_on && !cb_data.uno_on && !cb_data.wlc_tx &&
 	       !cb_data.wlc_rx && !cb_data.wlcin_off && !cb_data.chgin_off &&
-	       !cb_data.usb_wlc;
+	       !cb_data.usb_wlc && !cb_data.pogo_vout;
 	if (nope) {
 		pr_debug("%s: nope callback\n", __func__);
 		goto unlock_done;
@@ -1035,12 +1067,12 @@ static int max77759_mode_callback(struct gvotable_election *el,
 
 	dev_info(data->dev, "%s:%s full=%d raw=%d stby_on=%d, dc_on=%d, chgr_on=%d, buck_on=%d,"
 		" boost_on=%d, otg_on=%d, uno_on=%d wlc_tx=%d wlc_rx=%d usb_wlc=%d"
-		" chgin_off=%d wlcin_off=%d frs_on=%d\n",
+		" chgin_off=%d wlcin_off=%d frs_on=%d pogo_vout=%d\n",
 		__func__, trigger ? trigger : "<>",
 		data->charge_done, cb_data.use_raw, cb_data.stby_on, cb_data.dc_on,
 		cb_data.chgr_on, cb_data.buck_on, cb_data.boost_on, cb_data.otg_on,
 		cb_data.uno_on, cb_data.wlc_tx, cb_data.wlc_rx, cb_data.usb_wlc,
-		cb_data.chgin_off, cb_data.wlcin_off, cb_data.frs_on);
+		cb_data.chgin_off, cb_data.wlcin_off, cb_data.frs_on, cb_data.pogo_vout);
 
 	/* just use raw "as is", no changes to switches etc */
 	if (cb_data.use_raw) {
@@ -1087,7 +1119,7 @@ static int max77759_mode_callback(struct gvotable_election *el,
 				schedule_delayed_work(&data->otg_fccm_worker,
 						      msecs_to_jiffies(0));
 			} else {
-				alarm_try_to_cancel(&data->otg_fccm_alarm);
+				cancel_delayed_work_sync(&data->otg_fccm_worker);
 
 				/* Force to reset the FCCM mode to disable */
 				if (data->uc_data.ext_bst_mode > 0)
@@ -2154,6 +2186,9 @@ static int max77759_psy_set_property(struct power_supply *psy,
 		pr_debug("%s: topoff_current=%d (%d)\n",
 			__func__, pval->intval, ret);
 		break;
+	case GBMS_PROP_TAPER_CONTROL:
+		ret = 0;
+		break;
 	default:
 		break;
 	}
@@ -2238,7 +2273,9 @@ static int max77759_psy_get_property(struct power_supply *psy,
 		if (rc < 0)
 			pval->intval = rc;
 		break;
-
+	case GBMS_PROP_TAPER_CONTROL:
+		ret = 0;
+		break;
 	default:
 		pr_debug("property (%d) unsupported.\n", psp);
 		ret = -EINVAL;
@@ -2259,6 +2296,7 @@ static int max77759_psy_is_writeable(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_CURRENT_MAX:
 	case GBMS_PROP_CHARGE_DISABLE:
 	case POWER_SUPPLY_PROP_CHARGE_TERM_CURRENT:
+	case GBMS_PROP_TAPER_CONTROL:
 		return 1;
 	default:
 		break;
@@ -2915,13 +2953,15 @@ static void max77759_otg_fccm_worker(struct work_struct *work)
 						otg_fccm_worker.work);
 	int gpio_en, vbatt, ret;
 
+	__pm_stay_awake(data->otg_fccm_wake_lock);
+
 	if (data->uc_data.ext_bst_mode <= 0)
 		goto done_relax;
 
 	ret = max77759_read_vbatt(data, &vbatt);
 	if (ret < 0) {
 		schedule_delayed_work(&data->otg_fccm_worker, msecs_to_jiffies(50));
-		return;
+		goto done_relax;
         }
 
 	vbatt = vbatt / 1000;
@@ -2937,24 +2977,9 @@ static void max77759_otg_fccm_worker(struct work_struct *work)
 		gpio_set_value_cansleep(data->uc_data.ext_bst_mode, 0);
 	}
 
-	alarm_start_relative(&data->otg_fccm_alarm, ms_to_ktime(30000));
+	schedule_delayed_work(&data->otg_fccm_worker, msecs_to_jiffies(30000));
 done_relax:
 	__pm_relax(data->otg_fccm_wake_lock);
-}
-
-static enum alarmtimer_restart max77759_otg_fccm_alarm(struct alarm *alarm,
-						       ktime_t now)
-{
-	struct max77759_chgr_data *data =
-		container_of(alarm, struct max77759_chgr_data, otg_fccm_alarm);
-
-	__pm_stay_awake(data->otg_fccm_wake_lock);
-
-	if (data->uc_data.ext_bst_mode > 0)
-		schedule_delayed_work(&data->otg_fccm_worker,
-				      msecs_to_jiffies(0));
-
-	return ALARMTIMER_NORESTART;
 }
 
 #define MAX77759_FCCM_UPPERBD_VOL 4400
@@ -3114,8 +3139,6 @@ static int max77759_charger_probe(struct i2c_client *client,
 			 data->otg_fccm_vbatt_lowerbd,
 			 data->otg_fccm_vbatt_upperbd);
 
-	alarm_init(&data->otg_fccm_alarm, ALARM_BOOTTIME,
-		   max77759_otg_fccm_alarm);
 	INIT_DELAYED_WORK(&data->otg_fccm_worker, max77759_otg_fccm_worker);
 
 	ret = of_property_read_u32(dev->of_node, "max77759,chg-term-voltage",
@@ -3211,7 +3234,11 @@ static int max77759_charger_pm_resume(struct device *dev)
 		enable_irq(data->irq_int);
 		data->irq_disabled = false;
 	}
+
 	pm_runtime_put_sync(data->dev);
+
+	if ((data->otg_fccm_reset) && (data->otg_changed))
+		mod_delayed_work(system_wq, &data->otg_fccm_worker, 0);
 
 	return 0;
 }
